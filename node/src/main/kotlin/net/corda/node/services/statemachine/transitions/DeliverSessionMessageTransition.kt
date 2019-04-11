@@ -1,6 +1,7 @@
 package net.corda.node.services.statemachine.transitions
 
 import net.corda.core.flows.UnexpectedFlowEndException
+import net.corda.core.utilities.contextLogger
 import net.corda.node.services.statemachine.Action
 import net.corda.node.services.statemachine.ConfirmSessionMessage
 import net.corda.node.services.statemachine.DataSessionMessage
@@ -34,6 +35,11 @@ class DeliverSessionMessageTransition(
         override val startingState: StateMachineState,
         val event: Event.DeliverSessionMessage
 ) : Transition {
+
+    private companion object {
+        val log = contextLogger()
+    }
+
     override fun transition(): TransitionResult {
         return builder {
             // Add the DeduplicationHandler to the pending ones ASAP so in case an error happens we still know
@@ -112,8 +118,14 @@ class DeliverSessionMessageTransition(
 
     private fun TransitionBuilder.errorMessageTransition(sessionState: SessionState, payload: ErrorSessionMessage) {
         val exception: Throwable = if (payload.flowException == null) {
+            if (sessionState is SessionState.Initiated) {
+                log.info("Received unexpected counter-flow exception from party: ${sessionState.peerParty.name}")
+            }
             UnexpectedFlowEndException("Counter-flow errored", cause = null, originalErrorId = payload.errorId)
         } else {
+            if (sessionState is SessionState.Initiated) {
+                log.info("Received counter-flow exception: ${payload.flowException} from party: ${sessionState.peerParty.name}")
+            }
             payload.flowException.originalErrorId = payload.errorId
             payload.flowException
         }
