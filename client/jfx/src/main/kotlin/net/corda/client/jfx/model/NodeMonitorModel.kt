@@ -1,8 +1,9 @@
 package net.corda.client.jfx.model
 
+import javafx.application.Platform
 import javafx.beans.property.SimpleObjectProperty
 import net.corda.client.rpc.internal.ReconnectingCordaRPCOps
-import net.corda.client.rpc.internal.asReconnecting
+import net.corda.client.rpc.internal.asReconnectingWithInitialValues
 import net.corda.core.contracts.ContractState
 import net.corda.core.flows.StateMachineRunId
 import net.corda.core.identity.Party
@@ -61,7 +62,7 @@ class NodeMonitorModel : AutoCloseable {
      */
     override fun close() {
         try {
-            (rpc as? ReconnectingCordaRPCOps)!!.close()
+            (rpc as ReconnectingCordaRPCOps).close()
         } catch (e: Exception) {
             logger.error("Error closing RPC connection to node", e)
         }
@@ -84,19 +85,24 @@ class NodeMonitorModel : AutoCloseable {
         }.toSet()
         val consumedStates = statesSnapshot.states.toSet() - unconsumedStates
         val initialVaultUpdate = Vault.Update(consumedStates, unconsumedStates, references = emptySet())
-        vaultUpdates.asReconnecting().startWithValues(listOf(initialVaultUpdate)).subscribe(vaultUpdatesSubject::onNext)
+        vaultUpdates.asReconnectingWithInitialValues(listOf(initialVaultUpdate))
+                .subscribe(
+                        onNext = vaultUpdatesSubject::onNext,
+                        onDisconnect = { Platform.runLater { proxyObservable.value = null } },
+                        onReconnect = { Platform.runLater { proxyObservable.value = rpc } },
+                        onStop = {})
 
         // Transactions
         val (transactions, newTransactions) = rpc.internalVerifiedTransactionsFeed()
-        newTransactions.asReconnecting().startWithValues(transactions).subscribe(transactionsSubject::onNext)
+        newTransactions.asReconnectingWithInitialValues(transactions).subscribe(transactionsSubject::onNext)
 
         // SM -> TX mapping
         val (smTxMappings, futureSmTxMappings) = rpc.stateMachineRecordedTransactionMappingFeed()
-        futureSmTxMappings.asReconnecting().startWithValues(smTxMappings).subscribe(stateMachineTransactionMappingSubject::onNext)
+        futureSmTxMappings.asReconnectingWithInitialValues(smTxMappings).subscribe(stateMachineTransactionMappingSubject::onNext)
 
         // Parties on network
         val (parties, futurePartyUpdate) = rpc.networkMapFeed()
-        futurePartyUpdate.asReconnecting().startWithValues(parties.map(MapChange::Added)).subscribe(networkMapSubject::onNext)
+        futurePartyUpdate.asReconnectingWithInitialValues(parties.map(MapChange::Added)).subscribe(networkMapSubject::onNext)
 
         val stateMachines = rpc.stateMachinesSnapshot()
 

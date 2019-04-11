@@ -9,10 +9,7 @@ import net.corda.core.messaging.ClientRpcSslOptions
 import net.corda.core.messaging.CordaRPCOps
 import net.corda.core.messaging.DataFeed
 import net.corda.core.messaging.FlowHandle
-import net.corda.core.utilities.NetworkHostAndPort
-import net.corda.core.utilities.contextLogger
-import net.corda.core.utilities.minutes
-import net.corda.core.utilities.seconds
+import net.corda.core.utilities.*
 import net.corda.nodeapi.exceptions.RejectedCommandException
 import org.apache.activemq.artemis.api.core.ActiveMQConnectionTimedOutException
 import org.apache.activemq.artemis.api.core.ActiveMQSecurityException
@@ -192,7 +189,7 @@ class ReconnectingCordaRPCOps private constructor(
                     require(it.proxy.nodeInfo().legalIdentitiesAndCerts.isNotEmpty()) {
                         "Could not establish connection to ${nodeHostAndPorts}."
                     }
-                    log.debug("Connection successfully established with: ${nodeHostAndPorts}")
+                    log.debug { "Connection successfully established with: ${nodeHostAndPorts}" }
                 }
             } catch (ex: Exception) {
                 when (ex) {
@@ -203,15 +200,15 @@ class ReconnectingCordaRPCOps private constructor(
                     }
                     is RPCException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.debug("Exception upon establishing connection: ${ex.message}")
+                        log.debug { "Exception upon establishing connection: ${ex.message}" }
                     }
                     is ActiveMQConnectionTimedOutException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.debug("Exception upon establishing connection: ${ex.message}")
+                        log.debug { "Exception upon establishing connection: ${ex.message}" }
                     }
                     is ActiveMQUnBlockedException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.debug("Exception upon establishing connection: ${ex.message}")
+                        log.debug { "Exception upon establishing connection: ${ex.message}" }
                     }
                     else -> {
                         log.debug("Unknown exception upon establishing connection.", ex)
@@ -257,7 +254,7 @@ class ReconnectingCordaRPCOps private constructor(
     ) : Observable<T>(null), ReconnectingObservable<T> {
 
         private var initialStartWith: Iterable<T>? = null
-        private fun _subscribeWithReconnect(observerHandle: ObserverHandle, onNext: (T) -> Unit, onStop: () -> Unit, startWithValues: Iterable<T>? = null) {
+        private fun _subscribeWithReconnect(observerHandle: ObserverHandle, onNext: (T) -> Unit, onStop: () -> Unit, onDisconnect: () -> Unit, onReconnect: () -> Unit, startWithValues: Iterable<T>? = null) {
             var subscriptionError: Throwable?
             try {
                 val subscription = initial.updates.let { if (startWithValues != null) it.startWith(startWithValues) else it }
@@ -275,19 +272,21 @@ class ReconnectingCordaRPCOps private constructor(
                 return
             }
 
+            onDisconnect()
             // Only continue if the subscription failed.
             reconnectingRPCConnection.error(subscriptionError)
-            log.debug("Recreating data feed.")
+            log.debug { "Recreating data feed." }
 
             val newObservable = createDataFeed().updates as ReconnectingObservableImpl<T>
-            return newObservable._subscribeWithReconnect(observerHandle, onNext, onStop)
+            onReconnect()
+            return newObservable._subscribeWithReconnect(observerHandle, onNext, onStop, onDisconnect, onReconnect)
         }
 
-        override fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit): ObserverHandle {
+        override fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit, onDisconnect: () -> Unit, onReconnect: () -> Unit): ObserverHandle {
             val observerNotifier = ObserverHandle()
             // TODO - change the establish connection method to be non-blocking
             observersPool.execute {
-                _subscribeWithReconnect(observerNotifier, onNext, onStop, initialStartWith)
+                _subscribeWithReconnect(observerNotifier, onNext, onStop, onDisconnect, onReconnect, initialStartWith)
             }
             return observerNotifier
         }
@@ -303,9 +302,9 @@ class ReconnectingCordaRPCOps private constructor(
 
         override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
             val result: Any? = try {
-                log.debug("Invoking RPC $method...")
+                log.debug { "Invoking RPC $method..." }
                 method.invoke(reconnectingRPCConnection.proxy, *(args ?: emptyArray())).also {
-                    log.debug("RPC $method invoked successfully.")
+                    log.debug { "RPC $method invoked successfully." }
                 }
             } catch (e: InvocationTargetException) {
                 fun retry() = if (method.isStartFlow()) {
@@ -369,8 +368,8 @@ class ReconnectingCordaRPCOps private constructor(
  * TODO - provide a logical function to know how to retrieve missing events that happened during disconnects.
  */
 interface ReconnectingObservable<T> {
-    fun subscribe(onNext: (T) -> Unit): ObserverHandle = subscribe(onNext, {})
-    fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit): ObserverHandle
+    fun subscribe(onNext: (T) -> Unit): ObserverHandle = subscribe(onNext, {}, {}, {})
+    fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit, onDisconnect: () -> Unit, onReconnect: () -> Unit): ObserverHandle
     fun startWithValues(values: Iterable<T>): ReconnectingObservable<T>
 }
 
@@ -399,3 +398,5 @@ class CouldNotStartFlowException(cause: Throwable? = null) : RPCException("Could
  * Mainly for Kotlin users.
  */
 fun <T> Observable<T>.asReconnecting(): ReconnectingObservable<T> = uncheckedCast(this)
+
+fun <T> Observable<T>.asReconnectingWithInitialValues(values: Iterable<T>): ReconnectingObservable<T> = asReconnecting().startWithValues(values)

@@ -11,11 +11,10 @@ import net.corda.client.jackson.JacksonSupport
 import net.corda.client.jackson.StringToMethodCallParser
 import net.corda.client.rpc.CordaRPCClient
 import net.corda.client.rpc.CordaRPCClientConfiguration
-import net.corda.client.rpc.CordaRPCConnection
 import net.corda.client.rpc.PermissionException
 import net.corda.client.rpc.internal.ReconnectingCordaRPCOps
 import net.corda.client.rpc.internal.ReconnectingObservable
-import net.corda.client.rpc.internal.asReconnecting
+import net.corda.client.rpc.internal.asReconnectingWithInitialValues
 import net.corda.core.CordaException
 import net.corda.core.concurrent.CordaFuture
 import net.corda.core.contracts.UniqueIdentifier
@@ -92,11 +91,11 @@ object InteractiveShell {
 
     fun startShell(configuration: ShellConfiguration, classLoader: ClassLoader? = null, standalone: Boolean = false) {
         rpcOps = { username: String, password: String ->
-            if(standalone){
+            if (standalone) {
                 ReconnectingCordaRPCOps(configuration.hostAndPort, username, password, configuration.ssl, classLoader).also {
                     rpcConn = it
                 }
-            }else{
+            } else {
                 val client = CordaRPCClient(hostAndPort = configuration.hostAndPort,
                         configuration = CordaRPCClientConfiguration.DEFAULT.copy(
                                 maxReconnectAttempts = 1
@@ -445,7 +444,7 @@ object InteractiveShell {
         val currentStateMachines = stateMachines.map { StateMachineUpdate.Added(it) }
         val subscriber = FlowWatchPrintingSubscriber(out)
         if (stateMachineUpdates is ReconnectingObservable<*>) {
-            stateMachineUpdates.asReconnecting().startWithValues(currentStateMachines).subscribe { subscriber.onNext(it) }
+            stateMachineUpdates.asReconnectingWithInitialValues(currentStateMachines).subscribe(subscriber::onNext)
         } else {
             stateMachineUpdates.startWith(currentStateMachines).subscribe(subscriber)
         }
