@@ -1,5 +1,7 @@
 package net.corda.node.services.rpc
 
+import net.corda.client.rpc.internal.ReconnectingCordaRPCOps
+import net.corda.client.rpc.internal.asReconnecting
 import net.corda.core.contracts.Amount
 import net.corda.core.flows.StateMachineRunId
 import net.corda.core.internal.concurrent.transpose

@@ -368,7 +368,7 @@ The only way to confirm is to perform a business-level query and retry according
 In case users require such a functionality to write a resilient RPC client we have a sample that showcases how this can be implemented and also
 a thorough test that demonstrates it works as expected.
 
-The code that performs the reconnecting logic is: `ReconnectingCordaRPCOps.kt <https://github.com/corda/samples/blob/release-V|platform_version|/node/src/integration-test/kotlin/net/corda/node/services/rpc/ReconnectingCordaRPCOps.kt>`_.
+The code that performs the reconnecting logic is: `ReconnectingCordaRPCOps.kt <https://github.com/corda/samples/blob/release-V|platform_version|/net/corda/client/rpc/internal/ReconnectingCordaRPCOps.kt>`_.
 
 .. note:: This sample code is not exposed as an official Corda API, and must be included directly in the client codebase and adjusted.
 

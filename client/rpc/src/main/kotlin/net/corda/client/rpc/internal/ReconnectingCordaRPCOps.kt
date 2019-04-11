@@ -1,4 +1,4 @@
-package net.corda.node.services.rpc
+package net.corda.client.rpc.internal
 
 import net.corda.client.rpc.*
 import net.corda.core.flows.StateMachineRunId
@@ -43,27 +43,48 @@ import java.util.concurrent.TimeUnit
  *
  * *This class is not a stable API. Any project that wants to use it, must copy and paste it.*
  */
-class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCConnection: ReconnectingRPCConnection, private val observersPool: ExecutorService) : CordaRPCOps by proxy(reconnectingRPCConnection, observersPool) {
+class ReconnectingCordaRPCOps private constructor(
+        private val reconnectingRPCConnection: ReconnectingRPCConnection,
+        private val observersPool: ExecutorService,
+        private val userPool: Boolean
+) : AutoCloseable, CordaRPCOps by proxy(reconnectingRPCConnection, observersPool) {
+
+    // Constructors that mirror CordaRPCClient.
     constructor(
             nodeHostAndPort: NetworkHostAndPort,
             username: String,
             password: String,
             sslConfiguration: ClientRpcSslOptions? = null,
             classLoader: ClassLoader? = null,
-            observersPool: ExecutorService = Executors.newCachedThreadPool()
-    ) : this(ReconnectingRPCConnection(nodeHostAndPort, username, password, sslConfiguration, classLoader), observersPool)
+            observersPool: ExecutorService? = null
+    ) : this(
+            ReconnectingRPCConnection(listOf(nodeHostAndPort), username, password, sslConfiguration, classLoader),
+            observersPool ?: Executors.newCachedThreadPool(),
+            observersPool != null)
+
+    constructor(
+            nodeHostAndPorts: List<NetworkHostAndPort>,
+            username: String,
+            password: String,
+            sslConfiguration: ClientRpcSslOptions? = null,
+            classLoader: ClassLoader? = null,
+            observersPool: ExecutorService? = null
+    ) : this(
+            ReconnectingRPCConnection(nodeHostAndPorts, username, password, sslConfiguration, classLoader),
+            observersPool ?: Executors.newCachedThreadPool(),
+            observersPool != null)
 
     private companion object {
+        private val log = contextLogger()
         private fun proxy(reconnectingRPCConnection: ReconnectingRPCConnection, observersPool: ExecutorService): CordaRPCOps {
             return Proxy.newProxyInstance(
                     this::class.java.classLoader,
                     arrayOf(CordaRPCOps::class.java),
                     ErrorInterceptingHandler(reconnectingRPCConnection, observersPool)) as CordaRPCOps
         }
-
-        private val log = contextLogger()
-        private val retryFlowsPool = Executors.newScheduledThreadPool(1)
     }
+
+    private val retryFlowsPool = Executors.newScheduledThreadPool(1)
 
     /**
      * This function runs a flow and retries until it completes successfully.
@@ -115,13 +136,17 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
      * Helper class useful for reconnecting to a Node.
      */
     internal data class ReconnectingRPCConnection(
-            val nodeHostAndPort: NetworkHostAndPort,
+            val nodeHostAndPorts: List<NetworkHostAndPort>,
             val username: String,
             val password: String,
             val sslConfiguration: ClientRpcSslOptions? = null,
             val classLoader: ClassLoader?
     ) : RPCConnection<CordaRPCOps> {
         private var currentRPCConnection: CordaRPCConnection? = null
+
+        init {
+            connect()
+        }
 
         enum class CurrentState {
             UNCONNECTED, CONNECTED, CONNECTING, CLOSED, DIED
@@ -133,9 +158,7 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
             @Synchronized get() = when (currentState) {
                 CurrentState.CONNECTED -> currentRPCConnection!!
                 CurrentState.UNCONNECTED, CurrentState.CLOSED -> {
-                    currentState = CurrentState.CONNECTING
-                    currentRPCConnection = establishConnectionWithRetry()
-                    currentState = CurrentState.CONNECTED
+                    connect()
                     currentRPCConnection!!
                 }
                 CurrentState.CONNECTING, CurrentState.DIED -> throw IllegalArgumentException("Illegal state")
@@ -149,52 +172,56 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
         fun error(e: Throwable) {
             currentState = CurrentState.DIED
             //TODO - handle error cases
-            log.error("Reconnecting to ${this.nodeHostAndPort} due to error: ${e.message}")
+            log.error("Reconnecting to ${this.nodeHostAndPorts} due to error: ${e.message}")
+            connect()
+        }
+
+        private fun connect() {
             currentState = CurrentState.CONNECTING
             currentRPCConnection = establishConnectionWithRetry()
             currentState = CurrentState.CONNECTED
         }
 
-        private tailrec fun establishConnectionWithRetry(retryInterval: Duration = 1.seconds): CordaRPCConnection {
-            log.info("Connecting to: $nodeHostAndPort")
+        private tailrec fun establishConnectionWithRetry(retryInterval: Duration = 1.seconds, nrRetries: Int = 0): CordaRPCConnection {
+            log.info("Connecting to: $nodeHostAndPorts")
             try {
                 return CordaRPCClient(
-                        nodeHostAndPort, CordaRPCClientConfiguration(connectionMaxRetryInterval = retryInterval), sslConfiguration, classLoader
+                        nodeHostAndPorts, CordaRPCClientConfiguration(connectionMaxRetryInterval = retryInterval), sslConfiguration, classLoader
                 ).start(username, password).also {
                     // Check connection is truly operational before returning it.
                     require(it.proxy.nodeInfo().legalIdentitiesAndCerts.isNotEmpty()) {
-                        "Could not establish connection to ${nodeHostAndPort}."
+                        "Could not establish connection to ${nodeHostAndPorts}."
                     }
-                    log.info("Connection successfully established with: ${nodeHostAndPort}")
+                    log.debug("Connection successfully established with: ${nodeHostAndPorts}")
                 }
             } catch (ex: Exception) {
                 when (ex) {
                     is ActiveMQSecurityException -> {
                         // Happens when incorrect credentials provided.
                         // It can happen at startup as well when the credentials are correct.
-                        // TODO - add a counter to only retry 2-3 times on security exceptions,
+                        if (nrRetries > 1) throw ex
                     }
                     is RPCException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.info("Exception upon establishing connection: ${ex.message}")
+                        log.debug("Exception upon establishing connection: ${ex.message}")
                     }
                     is ActiveMQConnectionTimedOutException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.info("Exception upon establishing connection: ${ex.message}")
+                        log.debug("Exception upon establishing connection: ${ex.message}")
                     }
                     is ActiveMQUnBlockedException -> {
                         // Deliberately not logging full stack trace as it will be full of internal stacktraces.
-                        log.info("Exception upon establishing connection: ${ex.message}")
+                        log.debug("Exception upon establishing connection: ${ex.message}")
                     }
                     else -> {
-                        log.info("Unknown exception upon establishing connection.", ex)
+                        log.debug("Unknown exception upon establishing connection.", ex)
                     }
                 }
             }
 
             // Could not connect this time round - pause before giving another try.
             Thread.sleep(retryInterval.toMillis())
-            return establishConnectionWithRetry((retryInterval * 3) / 2)
+            return establishConnectionWithRetry((retryInterval * 3) / 2, nrRetries + 1)
         }
 
         override val proxy: CordaRPCOps
@@ -229,10 +256,12 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
             val createDataFeed: () -> DataFeed<*, T>
     ) : Observable<T>(null), ReconnectingObservable<T> {
 
-        private fun _subscribeWithReconnect(observerHandle: ObserverHandle, onNext: (T) -> Unit) {
+        private var initialStartWith: Iterable<T>? = null
+        private fun _subscribeWithReconnect(observerHandle: ObserverHandle, onNext: (T) -> Unit, onStop: () -> Unit, startWithValues: Iterable<T>? = null) {
             var subscriptionError: Throwable?
             try {
-                val subscription = initial.updates.subscribe(onNext, observerHandle::fail, observerHandle::stop)
+                val subscription = initial.updates.let { if (startWithValues != null) it.startWith(startWithValues) else it }
+                        .subscribe(onNext, observerHandle::fail, observerHandle::stop)
                 subscriptionError = observerHandle.await()
                 subscription.unsubscribe()
             } catch (e: Exception) {
@@ -241,23 +270,31 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
             }
 
             // In case there was no exception the observer has finished gracefully.
-            if (subscriptionError == null) return
+            if (subscriptionError == null) {
+                onStop()
+                return
+            }
 
             // Only continue if the subscription failed.
             reconnectingRPCConnection.error(subscriptionError)
-            log.info("Recreating data feed.")
+            log.debug("Recreating data feed.")
 
             val newObservable = createDataFeed().updates as ReconnectingObservableImpl<T>
-            return newObservable._subscribeWithReconnect(observerHandle, onNext)
+            return newObservable._subscribeWithReconnect(observerHandle, onNext, onStop)
         }
 
-        override fun subscribe(onNext: (T) -> Unit): ObserverHandle {
+        override fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit): ObserverHandle {
             val observerNotifier = ObserverHandle()
             // TODO - change the establish connection method to be non-blocking
             observersPool.execute {
-                _subscribeWithReconnect(observerNotifier, onNext = onNext)
+                _subscribeWithReconnect(observerNotifier, onNext, onStop, initialStartWith)
             }
             return observerNotifier
+        }
+
+        override fun startWithValues(values: Iterable<T>): ReconnectingObservable<T> {
+            initialStartWith = values
+            return this
         }
     }
 
@@ -266,9 +303,9 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
 
         override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
             val result: Any? = try {
-                log.info("Invoking RPC $method...")
+                log.debug("Invoking RPC $method...")
                 method.invoke(reconnectingRPCConnection.proxy, *(args ?: emptyArray())).also {
-                    log.info("RPC $method invoked successfully.")
+                    log.debug("RPC $method invoked successfully.")
                 }
             } catch (e: InvocationTargetException) {
                 fun retry() = if (method.isStartFlow()) {
@@ -319,14 +356,22 @@ class ReconnectingCordaRPCOps private constructor(private val reconnectingRPCCon
         }
     }
 
-    fun close() = reconnectingRPCConnection.forceClose()
+    override fun close() {
+        if (!userPool) observersPool.shutdown()
+        retryFlowsPool.shutdown()
+        reconnectingRPCConnection.forceClose()
+    }
 }
 
 /**
  * Returned as the `updates` field when calling methods that return a [DataFeed] on the [ReconnectingCordaRPCOps].
+ *
+ * TODO - provide a logical function to know how to retrieve missing events that happened during disconnects.
  */
 interface ReconnectingObservable<T> {
-    fun subscribe(onNext: (T) -> Unit): ObserverHandle
+    fun subscribe(onNext: (T) -> Unit): ObserverHandle = subscribe(onNext, {})
+    fun subscribe(onNext: (T) -> Unit, onStop: () -> Unit): ObserverHandle
+    fun startWithValues(values: Iterable<T>): ReconnectingObservable<T>
 }
 
 /**
